@@ -1,0 +1,364 @@
+diff --git a/Makefile b/Makefile
+index cd79933..13e9d20 100644
+--- a/Makefile
++++ b/Makefile
+@@ -175,6 +175,7 @@ UPROGS=\
+ 	$U/_grind\
+ 	$U/_wc\
+ 	$U/_zombie\
++	$U/_symlinktest\
+ 
+ 
+ 
+diff --git a/kernel/fcntl.h b/kernel/fcntl.h
+index 44861b9..c20bfcc 100644
+--- a/kernel/fcntl.h
++++ b/kernel/fcntl.h
+@@ -3,3 +3,4 @@
+ #define O_RDWR    0x002
+ #define O_CREATE  0x200
+ #define O_TRUNC   0x400
++#define O_NOFOLLOW 0x010 // 新增标志，表示不跟随符号链接
+diff --git a/kernel/file.h b/kernel/file.h
+index b076d1d..5c4eb3a 100644
+--- a/kernel/file.h
++++ b/kernel/file.h
+@@ -26,7 +26,7 @@ struct inode {
+   short minor;
+   short nlink;
+   uint size;
+-  uint addrs[NDIRECT+1];
++  uint addrs[NDIRECT+2];
+ };
+ 
+ // map major device number to device functions.
+diff --git a/kernel/fs.c b/kernel/fs.c
+index f33553a..b68e978 100644
+--- a/kernel/fs.c
++++ b/kernel/fs.c
+@@ -374,28 +374,72 @@ iunlockput(struct inode *ip)
+ 
+ // Return the disk block address of the nth block in inode ip.
+ // If there is no such block, bmap allocates one.
+-static uint
++uint
+ bmap(struct inode *ip, uint bn)
+ {
+   uint addr, *a;
+   struct buf *bp;
+ 
+-  if(bn < NDIRECT){
+-    if((addr = ip->addrs[bn]) == 0)
+-      ip->addrs[bn] = addr = balloc(ip->dev);
++  if (bn < NDIRECT) { // 直接块
++    if ((addr = ip->addrs[bn]) == 0) {
++      addr = balloc(ip->dev);
++      if (addr == 0) return 0;
++      ip->addrs[bn] = addr;
++    }
+     return addr;
+   }
+   bn -= NDIRECT;
+ 
+-  if(bn < NINDIRECT){
+-    // Load indirect block, allocating if necessary.
+-    if((addr = ip->addrs[NDIRECT]) == 0)
+-      ip->addrs[NDIRECT] = addr = balloc(ip->dev);
++  if (bn < NINDIRECT) { // 单间接块
++    if ((addr = ip->addrs[NDIRECT]) == 0) {
++      addr = balloc(ip->dev);
++      if (addr == 0) return 0;
++      ip->addrs[NDIRECT] = addr;
++    }
++    bp = bread(ip->dev, addr);
++    a = (uint*)bp->data;
++    if ((addr = a[bn]) == 0) {
++      addr = balloc(ip->dev);
++      if (addr) {
++        a[bn] = addr;
++        log_write(bp);
++      }
++    }
++    brelse(bp);
++    return addr;
++  }
++
++  bn -= NINDIRECT;
++
++  if (bn < DINDIRECT) { // 双间接块
++    if ((addr = ip->addrs[NDIRECT + 1]) == 0) {
++      addr = balloc(ip->dev);
++      if (addr == 0) return 0;
++      ip->addrs[NDIRECT + 1] = addr;
++    }
++
++    bp = bread(ip->dev, addr);
++    a = (uint*)bp->data;
++    uint indirect_idx = bn / NINDIRECT;
++    uint block_idx = bn % NINDIRECT;
++
++    if ((addr = a[indirect_idx]) == 0) {
++      addr = balloc(ip->dev);
++      if (addr) {
++        a[indirect_idx] = addr;
++        log_write(bp);
++      }
++    }
++    brelse(bp);
++
+     bp = bread(ip->dev, addr);
+     a = (uint*)bp->data;
+-    if((addr = a[bn]) == 0){
+-      a[bn] = addr = balloc(ip->dev);
+-      log_write(bp);
++    if ((addr = a[block_idx]) == 0) {
++      addr = balloc(ip->dev);
++      if (addr) {
++        a[block_idx] = addr;
++        log_write(bp);
++      }
+     }
+     brelse(bp);
+     return addr;
+@@ -409,29 +453,50 @@ bmap(struct inode *ip, uint bn)
+ void
+ itrunc(struct inode *ip)
+ {
++  struct buf *bp, *bp2;
++  uint *a, *b;
+   int i, j;
+-  struct buf *bp;
+-  uint *a;
+ 
+-  for(i = 0; i < NDIRECT; i++){
+-    if(ip->addrs[i]){
++  // 释放直接块
++  for (i = 0; i < NDIRECT; i++) {
++    if (ip->addrs[i]) {
+       bfree(ip->dev, ip->addrs[i]);
+       ip->addrs[i] = 0;
+     }
+   }
+ 
+-  if(ip->addrs[NDIRECT]){
++  // 释放单间接块
++  if (ip->addrs[NDIRECT]) {
+     bp = bread(ip->dev, ip->addrs[NDIRECT]);
+     a = (uint*)bp->data;
+-    for(j = 0; j < NINDIRECT; j++){
+-      if(a[j])
+-        bfree(ip->dev, a[j]);
++    for (j = 0; j < NINDIRECT; j++) {
++      if (a[j]) bfree(ip->dev, a[j]);
+     }
+     brelse(bp);
+     bfree(ip->dev, ip->addrs[NDIRECT]);
+     ip->addrs[NDIRECT] = 0;
+   }
+ 
++  // 释放双间接块
++  if (ip->addrs[NDIRECT + 1]) {
++    bp = bread(ip->dev, ip->addrs[NDIRECT + 1]);
++    a = (uint*)bp->data;
++    for (i = 0; i < NINDIRECT; i++) {
++      if (a[i]) {
++        bp2 = bread(ip->dev, a[i]);
++        b = (uint*)bp2->data;
++        for (j = 0; j < NINDIRECT; j++) {
++          if (b[j]) bfree(ip->dev, b[j]);
++        }
++        brelse(bp2);
++        bfree(ip->dev, a[i]);
++      }
++    }
++    brelse(bp);
++    bfree(ip->dev, ip->addrs[NDIRECT + 1]);
++    ip->addrs[NDIRECT + 1] = 0;
++  }
++
+   ip->size = 0;
+   iupdate(ip);
+ }
+diff --git a/kernel/fs.h b/kernel/fs.h
+index 139dcc9..f527e66 100644
+--- a/kernel/fs.h
++++ b/kernel/fs.h
+@@ -1,7 +1,6 @@
+ // On-disk file system format.
+ // Both the kernel and user programs use this header file.
+ 
+-
+ #define ROOTINO  1   // root i-number
+ #define BSIZE 1024  // block size
+ 
+@@ -24,18 +23,18 @@ struct superblock {
+ 
+ #define FSMAGIC 0x10203040
+ 
+-#define NDIRECT 12
++#define NDIRECT 11
+ #define NINDIRECT (BSIZE / sizeof(uint))
+-#define MAXFILE (NDIRECT + NINDIRECT)
++#define DINDIRECT (NINDIRECT * NINDIRECT) // 双间接块中直接块总数
++#define MAXFILE (NDIRECT + NINDIRECT + DINDIRECT)
+ 
+-// On-disk inode structure
+ struct dinode {
+-  short type;           // File type
+-  short major;          // Major device number (T_DEVICE only)
+-  short minor;          // Minor device number (T_DEVICE only)
+-  short nlink;          // Number of links to inode in file system
+-  uint size;            // Size of file (bytes)
+-  uint addrs[NDIRECT+1];   // Data block addresses
++  short type;           // 文件类型
++  short major;          // 主设备号
++  short minor;          // 次设备号
++  short nlink;          // 文件系统中的链接数
++  uint size;            // 文件大小（字节）
++  uint addrs[NDIRECT+2]; // 数据块地址（11个直接，1个单间接，1个双间接）
+ };
+ 
+ // Inodes per block.
+diff --git a/kernel/stat.h b/kernel/stat.h
+index 19543af..88d03d9 100644
+--- a/kernel/stat.h
++++ b/kernel/stat.h
+@@ -1,6 +1,7 @@
+ #define T_DIR     1   // Directory
+ #define T_FILE    2   // File
+ #define T_DEVICE  3   // Device
++#define T_SYMLINK 4 // 新增符号链接类型
+ 
+ struct stat {
+   int dev;     // File system's disk device
+diff --git a/kernel/syscall.c b/kernel/syscall.c
+index c1b3670..1697b62 100644
+--- a/kernel/syscall.c
++++ b/kernel/syscall.c
+@@ -104,6 +104,7 @@ extern uint64 sys_unlink(void);
+ extern uint64 sys_wait(void);
+ extern uint64 sys_write(void);
+ extern uint64 sys_uptime(void);
++extern uint64 sys_symlink(void);
+ 
+ static uint64 (*syscalls[])(void) = {
+ [SYS_fork]    sys_fork,
+@@ -127,6 +128,7 @@ static uint64 (*syscalls[])(void) = {
+ [SYS_link]    sys_link,
+ [SYS_mkdir]   sys_mkdir,
+ [SYS_close]   sys_close,
++[SYS_symlink] sys_symlink,
+ };
+ 
+ void
+diff --git a/kernel/syscall.h b/kernel/syscall.h
+index bc5f356..300d8ca 100644
+--- a/kernel/syscall.h
++++ b/kernel/syscall.h
+@@ -20,3 +20,4 @@
+ #define SYS_link   19
+ #define SYS_mkdir  20
+ #define SYS_close  21
++#define SYS_symlink 22 
+diff --git a/kernel/sysfile.c b/kernel/sysfile.c
+index 5dc453b..0f747ac 100644
+--- a/kernel/sysfile.c
++++ b/kernel/sysfile.c
+@@ -316,12 +316,30 @@ sys_open(void)
+     }
+   }
+ 
+-  if(ip->type == T_DEVICE && (ip->major < 0 || ip->major >= NDEV)){
+-    iunlockput(ip);
+-    end_op();
+-    return -1;
++  if(ip->type == T_SYMLINK && !(omode & O_NOFOLLOW)) {
++        for(int i = 0; i < 10; ++i) {
++          if(readi(ip, 0, (uint64)path, 0, MAXPATH) != MAXPATH) {
++            iunlockput(ip);
++            end_op();
++            return -1;
++          }
++          iunlockput(ip);
++          ip = namei(path);
++          if(ip == 0) {
++            end_op();
++            return -1;
++          }
++          ilock(ip);
++          if(ip->type != T_SYMLINK)
++            break;
++        }
++
++        if(ip->type == T_SYMLINK) {
++          iunlockput(ip);
++          end_op();
++          return -1;
++        }
+   }
+-
+   if((f = filealloc()) == 0 || (fd = fdalloc(f)) < 0){
+     if(f)
+       fileclose(f);
+@@ -484,3 +502,27 @@ sys_pipe(void)
+   }
+   return 0;
+ }
++uint64
++sys_symlink(void) {
++  char target[MAXPATH], path[MAXPATH];
++
++  if(argstr(0, target, MAXPATH) < 0 || argstr(1, path, MAXPATH) < 0)
++    return -1;
++
++  begin_op();
++  struct inode *node = create(path, T_SYMLINK, 0, 0);
++  if(node == 0) {
++    end_op();
++    return -1;
++  }
++
++  if(writei(node, 0, (uint64)target, 0, MAXPATH) < MAXPATH) {
++    iunlockput(node);
++    end_op();
++    return -1;
++  }
++
++  iunlockput(node);
++  end_op();
++  return 0;
++}
+diff --git a/mkfs/mkfs b/mkfs/mkfs
+new file mode 100755
+index 0000000..298d360
+Binary files /dev/null and b/mkfs/mkfs differ
+diff --git a/time.txt b/time.txt
+new file mode 100644
+index 0000000..7813681
+--- /dev/null
++++ b/time.txt
+@@ -0,0 +1 @@
++5
+\ No newline at end of file
+diff --git a/user/user.h b/user/user.h
+index b71ecda..f319686 100644
+--- a/user/user.h
++++ b/user/user.h
+@@ -23,6 +23,7 @@ int getpid(void);
+ char* sbrk(int);
+ int sleep(int);
+ int uptime(void);
++int symlink(const char *target, const char *path);
+ 
+ // ulib.c
+ int stat(const char*, struct stat*);
+diff --git a/user/usys.pl b/user/usys.pl
+index 01e426e..65a8d6b 100755
+--- a/user/usys.pl
++++ b/user/usys.pl
+@@ -36,3 +36,4 @@ entry("getpid");
+ entry("sbrk");
+ entry("sleep");
+ entry("uptime");
++entry("symlink");
+\ No newline at end of file
